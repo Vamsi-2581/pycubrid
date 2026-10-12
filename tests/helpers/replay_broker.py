@@ -27,6 +27,7 @@ from __future__ import annotations
 import socket
 import struct
 import threading
+import time
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
@@ -158,11 +159,16 @@ class Reply:
     ``body`` (CAS_INFO first) is framed with its DATA_LENGTH unless ``raw`` is
     given, which is sent as is. ``close`` closes the session afterwards; a
     reply with neither ``body`` nor ``raw`` closes it without answering.
+    ``fragments`` > 1 sends the bytes in that many near-equal pieces (at most
+    one per byte) with
+    ``fragment_interval`` seconds between consecutive pieces (a slow peer).
     """
 
     body: bytes | None = None
     raw: bytes | None = None
     close: bool = False
+    fragments: int = 1
+    fragment_interval: float = 0.0
 
 
 @dataclass
@@ -353,7 +359,12 @@ class ReplayBroker:
         if data is None and reply.body is not None:
             data = framed(reply.body)
         if data is not None:
-            client.sendall(data)
+            pieces = max(1, min(reply.fragments, len(data)))
+            bounds = [len(data) * i // pieces for i in range(pieces + 1)]
+            for i in range(pieces):
+                if i:
+                    time.sleep(reply.fragment_interval)
+                client.sendall(data[bounds[i] : bounds[i + 1]])
         return data is not None and not reply.close
 
     # -- default replies -----------------------------------------------------
