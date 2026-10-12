@@ -612,6 +612,15 @@ the documented release contract stays complete alongside `CHANGELOG.md`:
   signatures, dependencies and supported versions are unchanged. The BLOB/CLOB
   FC3 binding is internal; no public LOB binding API is added by this change.
 
+- **Placeholder tokenisation cached per `executemany()` call (#837)** — PATCH /
+  internal performance change with no behavior change. The SQL that
+  `executemany()` renders, its errors and the parameter set that raises them,
+  request bytes and public signatures are unchanged; the `PARAMETER_BINDING.md`
+  contract is untouched. The escape mode is read once per call, before the first
+  set is checked, instead of once per set; the two differ only if iterating the
+  parameter sets reconnects the connection, and the send-time generation check
+  rejects such SQL either way.
+
 - **Faster FETCH row parsing (#559)** — PATCH / internal performance change
   with no behavior change. Row values, `DataError` / malformed-reply
   classification, connection lifetime, request bytes, public signatures,
