@@ -16,6 +16,8 @@ from ._connection_common import (
     no_backslash_escapes_from_probe,
     resolve_ssl_context,
     warn_unknown_connection_options,
+    _check_prepared_batch_statement,
+    _check_prepared_lobs,
 )
 from .constants import CCIDbParam, DataSize
 from .exceptions import DataError, Error, InterfaceError, OperationalError
@@ -26,13 +28,16 @@ from .protocol import (
     CloseDatabasePacket,
     CloseQueryPacket,
     CommitPacket,
+    ExecuteArrayPacket,
     FetchPacket,
     GetEngineVersionPacket,
     GetSchemaPacket,
     OpenDatabasePacket,
     PrepareAndExecutePacket,
+    PreparePacket,
     RollbackPacket,
     SetDbParameterPacket,
+    _PreparedBinding,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -902,6 +907,46 @@ class Connection(ConnectionCommonMixin):
             self._check_reconnect()
             return self._physical_generation
 
+    def _prepare_and_execute_array(
+        self,
+        owner: Any,
+        sql: str,
+        rows: tuple[tuple[_PreparedBinding, ...], ...],
+        generation: int,
+    ) -> ExecuteArrayPacket:
+        """Send ``PREPARE`` and one ``EXECUTE_ARRAY`` on one session (#839).
+
+        ``generation`` is the session the caller probed before resetting its
+        state; a replacement since then rejects either request before send.
+        The cursor ``owner`` takes the handle as soon as ``PREPARE`` returns,
+        so every exit leaves it to the usual release paths (#488, #584).
+        """
+        with self._session_lock:
+            auto_commit = self._autocommit
+            _check_prepared_lobs(rows, self, generation, auto_commit)
+            if auto_commit and self._schema_results:
+                # Close them before PREPARE: FC21 would otherwise send their
+                # CLOSE_REQ between the two, where no CHECK_CAS may run. A
+                # reconnect here makes PREPARE fail its generation fence.
+                self._close_schema_results()
+            prepare = PreparePacket(sql, auto_commit=auto_commit)
+            prepare.carries_deferred_closes = True
+            self._send_and_receive(prepare, bound_generation=generation)
+            owner._query_handle = prepare.query_handle
+            owner._handle_generation = generation
+            owner._statement_type = prepare.statement_type
+            _check_prepared_batch_statement(prepare, len(rows[0]))
+            packet = ExecuteArrayPacket(
+                prepare.query_handle,
+                rows,
+                auto_commit=auto_commit,
+                bind_count=prepare.bind_count,
+                protocol_version=self._protocol_version,
+            )
+            # No CHECK_CAS between the two: the handle exists only on this CAS.
+            self._send_and_receive(packet, allow_reconnect=False, bound_generation=generation)
+            return packet
+
     def _send_and_receive_locked(
         self,
         packet: Any,
@@ -924,7 +969,13 @@ class Connection(ConnectionCommonMixin):
         if (
             self._schema_results
             and isinstance(
-                packet, (PrepareAndExecutePacket, BatchExecutePacket, GetEngineVersionPacket)
+                packet,
+                (
+                    PrepareAndExecutePacket,
+                    BatchExecutePacket,
+                    ExecuteArrayPacket,
+                    GetEngineVersionPacket,
+                ),
             )
             and packet.auto_commit
         ):
@@ -946,7 +997,9 @@ class Connection(ConnectionCommonMixin):
             # Every request on this connection uses its charset (#86); encoding
             # happens in write(), so an unencodable value sends nothing.
             packet.encoding = self._encoding
-            if isinstance(packet, PrepareAndExecutePacket):
+            if isinstance(packet, PrepareAndExecutePacket) or (
+                isinstance(packet, PreparePacket) and packet.carries_deferred_closes
+            ):
                 # Release queued handles of this session with this request (#488).
                 deferred_count, packet.deferred_close_handles = self._peek_deferred_closes()
             elif (

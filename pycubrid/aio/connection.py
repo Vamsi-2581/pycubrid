@@ -17,6 +17,8 @@ from pycubrid._connection_common import (
     no_backslash_escapes_from_probe,
     resolve_ssl_context,
     warn_unknown_connection_options,
+    _check_prepared_batch_statement,
+    _check_prepared_lobs,
 )
 from pycubrid.constants import CCIDbParam, DataSize
 from pycubrid.exceptions import (
@@ -34,13 +36,16 @@ from pycubrid.protocol import (
     CloseDatabasePacket,
     CloseQueryPacket,
     CommitPacket,
+    ExecuteArrayPacket,
     FetchPacket,
     GetEngineVersionPacket,
     GetSchemaPacket,
     OpenDatabasePacket,
     PrepareAndExecutePacket,
+    PreparePacket,
     RollbackPacket,
     SetDbParameterPacket,
+    _PreparedBinding,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -987,7 +992,13 @@ class AsyncConnection(ConnectionCommonMixin):
         if (
             self._schema_results
             and isinstance(
-                packet, (PrepareAndExecutePacket, BatchExecutePacket, GetEngineVersionPacket)
+                packet,
+                (
+                    PrepareAndExecutePacket,
+                    BatchExecutePacket,
+                    ExecuteArrayPacket,
+                    GetEngineVersionPacket,
+                ),
             )
             and packet.auto_commit
         ):
@@ -1059,7 +1070,9 @@ class AsyncConnection(ConnectionCommonMixin):
         # happens in write(), so an unencodable value sends nothing.
         packet.encoding = self._encoding
         deferred_count = 0
-        if isinstance(packet, PrepareAndExecutePacket):
+        if isinstance(packet, PrepareAndExecutePacket) or (
+            isinstance(packet, PreparePacket) and packet.carries_deferred_closes
+        ):
             # Release queued handles of this session with this request (#488).
             deferred_count, packet.deferred_close_handles = self._peek_deferred_closes()
         elif (
@@ -1133,6 +1146,49 @@ class AsyncConnection(ConnectionCommonMixin):
         async with self._lock:
             await self._check_reconnect_locked()
             return self._physical_generation
+
+    async def _prepare_and_execute_array(
+        self,
+        owner: Any,
+        sql: str,
+        rows: tuple[tuple[_PreparedBinding, ...], ...],
+        generation: int,
+    ) -> ExecuteArrayPacket:
+        """Send ``PREPARE`` and one ``EXECUTE_ARRAY`` under one lock hold (#839).
+
+        Holding the lock across both requests keeps another task's commit,
+        rollback or reconnect from freeing the handle in between. The cursor
+        ``owner`` takes the handle as soon as ``PREPARE`` returns, so every
+        exit leaves it to the usual release paths (#488, #584).
+        """
+        await self._wait_for_setup_if_needed()
+        async with self._lock:
+            auto_commit = self._autocommit
+            _check_prepared_lobs(rows, self, generation, auto_commit)
+            if auto_commit and self._schema_results:
+                # Close them before PREPARE: FC21 would otherwise send their
+                # CLOSE_REQ between the two, where no CHECK_CAS may run. A
+                # reconnect here makes PREPARE fail its generation fence.
+                await self._close_schema_results_locked()
+            prepare = PreparePacket(sql, auto_commit=auto_commit)
+            prepare.carries_deferred_closes = True
+            await self._send_and_receive_locked(prepare, expected_escape_generation=generation)
+            owner._query_handle = prepare.query_handle
+            owner._handle_generation = generation
+            owner._statement_type = prepare.statement_type
+            _check_prepared_batch_statement(prepare, len(rows[0]))
+            packet = ExecuteArrayPacket(
+                prepare.query_handle,
+                rows,
+                auto_commit=auto_commit,
+                bind_count=prepare.bind_count,
+                protocol_version=self._protocol_version,
+            )
+            # No CHECK_CAS between the two: the handle exists only on this CAS.
+            await self._send_and_receive_locked(
+                packet, allow_reconnect=False, expected_escape_generation=generation
+            )
+            return packet
 
     async def _check_reconnect(self, *, allow_reconnect: bool = True) -> bool:
         async with self._lock:

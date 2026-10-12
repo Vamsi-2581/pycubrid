@@ -25,6 +25,7 @@ change to the rules below is a contract change governed by
   - [Escape-processing mode](#escape-processing-mode-no_backslash_escapesfalse)
 - [Placeholder Tokenizer](#placeholder-tokenizer)
 - [`executemany`](#executemany)
+  - [`executemany(..., prepared=True)`](#executemany-preparedtrue)
 - [Non-Guarantees and Explicit Limits](#non-guarantees-and-explicit-limits)
 - [Compatibility Policy (1.x)](#compatibility-policy-1x)
 - [Pinned Tests](#pinned-tests)
@@ -56,7 +57,9 @@ between sync and async binding; parity is enforced by
 
 **This is not server-side prepared-statement binding.** pycubrid does not send
 parameter values as a separate typed payload; the broker receives a complete
-SQL text per execute. See
+SQL text per execute. The one exception on the ordinary cursors is the opt-in
+[`executemany(..., prepared=True)`](#executemany-preparedtrue) (#839), which
+sends typed host variables with `PREPARE` + `EXECUTE_ARRAY`. See
 [Non-Guarantees and Explicit Limits](#non-guarantees-and-explicit-limits).
 The separate, **explicit sync-only** `pycubrid.compat.native` prepared cursor
 does send typed values (INT, BIGINT, DOUBLE, NUMERIC, DATE, TIME, DATETIME,
@@ -376,7 +379,8 @@ text, so some results differ from the literal path. Verified on CUBRID 10.2,
   column when it is out of range, and a TIME into a DATETIME target.
 - **Typed collections.** `Set`, `Multiset` and `Sequence` are rendered by the
   literal path but raise `ProgrammingError` in `bind_param()`; use
-  `connection.set()` and `bind_set()`.
+  `connection.set()` and `bind_set()`. `executemany(..., prepared=True)` sends
+  them as collections of string elements (see below).
 - **Integers past 38 digits** raise `DataError` before any I/O. The literal path
   sends the digits and the server rejects them (-494, "Invalid numeric").
 
@@ -530,6 +534,31 @@ For non-DML statements, `executemany` falls back to a per-row `execute` loop
 
 Each row is bound independently with the same type-mapping rules above.
 
+### `executemany(..., prepared=True)`
+
+With `prepared=True` (#839) no SQL is rendered. For `INSERT`, `UPDATE`,
+`DELETE` and `MERGE` the cursor sends one `PREPARE` and one `EXECUTE_ARRAY`
+request (function code 21) whose arguments are one type byte and value per
+marker per row, in row order. Values follow the
+[prepared host-variable mapping](#prepared-host-variable-mapping), with the
+same checks and the same differences from literals (host-variable coercion,
+`float` as DOUBLE, empty `bytes` rejected). In addition:
+
+- `Set`, `Multiset` and `Sequence` are sent as collections of STRING elements:
+  `str` elements as they are, `int` elements (not `bool`) as decimal text and
+  `None` as a NULL element; the server converts them to the column's element
+  type. Other element types raise `ProgrammingError`. A `Multiset` is sent with
+  the SEQUENCE kind, because the 10.2-11.4 brokers reject the MULTISET bind kind
+  (-454) and a SET kind would drop duplicates.
+- A `pycubrid.Lob` of the same connection is bound by its handle, only with
+  autocommit off.
+- Every row is encoded before anything is sent; a rejected value names its
+  position (`rows[i][j]`) and never its contents. Each value carries its own
+  type, so a column may hold an `int` in one row and a `Decimal` or `None` in
+  the next.
+- Other statements raise `NotSupportedError`; there is no fallback to the
+  literal batch.
+
 ---
 
 ## Non-Guarantees and Explicit Limits
@@ -541,7 +570,9 @@ them implicitly.
 - **Ordinary sync/async cursors do not use server-side prepared binding.**
   `pycubrid.Cursor` and `pycubrid.aio.AsyncCursor` render parameters into SQL
   text on the client, so their `execute()` sends a complete SQL string without
-  a typed value payload or statement-handle cache. The separate, opt-in
+  a typed value payload or statement-handle cache. Only the opt-in
+  `executemany(..., prepared=True)` (#839) sends typed host variables; it
+  prepares the statement once per call and caches no handle across calls. The separate, opt-in
   `pycubrid.compat.native` sync cursor has a narrow typed scalar contract;
   its performance and plan-cache effects are not claimed here.
 - **Identifiers are not escaped.** Code paths that interpolate identifiers
@@ -637,6 +668,12 @@ any of these are contract regressions:
 - `tests/test_typed_collections.py` — typed `Set`/`Multiset`/`Sequence`
   rendering, element hardening and nested-collection rejection; sync/async
   parity in `tests/test_replay_parity.py::typed_collection_parameters`.
+- `tests/test_execute_array.py` — `executemany(..., prepared=True)`: the
+  EXECUTE_ARRAY request and reply bytes, per-row value encoding and position
+  messages, the statement and LOB rules, and sync/async handle ownership.
+- `tests/test_integration_execute_array.py` — live prepared batches on CUBRID
+  10.2-11.4: partial failure, autocommit, `rowcount`, mixed types, NULLs,
+  collections and LOB values against the literal batch.
 
 Together these tests provide the executable specification of this contract.
 
