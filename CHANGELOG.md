@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- **Empty `BIT`/`BIT VARYING` values (#994)** — code that tests `v is None` on a `BIT` or
+  `BIT VARYING` column to detect an empty value now sees `b""` for `X''`; `NULL` is still
+  `None`.
+
 ### Changed
 
 - **The execute and fetch profilers no longer drop an existing `_profile_tmp` table (#950)** —
@@ -21,6 +27,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   table; it is not retried through a reconnect. The driver itself is unchanged.
 
 ### Fixed
+
+- **An empty `BIT VARYING` value is fetched as `b""`, not `None` (#994)** — the CAS writes a
+  NULL row cell as size `-1` and an empty bit string (`X''`, or `b""` bound on the literal
+  path) as size `0`, but the row decoder read every size `<= 0` as NULL. A stored empty value
+  (`v IS NULL` is 0, `BIT_LENGTH(v)` is 0) was indistinguishable from NULL in Python, so a
+  read-modify-write turned it into NULL. A `BIT`/`VARBIT` cell of size `0` now decodes as
+  `b""`, also after a CALL or NULL-typed cell header, sync and async, as the official JDBC
+  driver reads it. Size-0 cells of every other type, and zero-length collection elements,
+  still decode as `None`. The prepared path still rejects `b""`, because the broker reads a
+  zero-length bind as NULL.
 
 - **A `?` inside a quoted identifier raises an explained `ProgrammingError` (#990)** —
   the CUBRID broker counts every `?` outside comments and single-quoted strings as a
