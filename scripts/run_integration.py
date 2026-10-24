@@ -15,10 +15,22 @@ recipes used to spell out in shell:
 2. ``scripts/wait_for_cubrid.py 36 5``, given the compose container ID in
    ``CUBRID_TEST_DOCKER_CONTAINER`` so a volume registered for a stale host fails
    fast with a repair hint (#1000);
-3. pytest for the lane, writing JUnit XML to ``--results``;
+3. pytest for the lane, writing JUnit XML to ``--results`` (default
+   ``test-results/integration/junit.xml``, ``test-results/integration-tls/junit.xml`` for
+   the TLS lane);
 4. ``scripts/check_integration_lanes.py --results ...``, which fails when every
    selected test skipped;
-5. ``docker compose -p <project> down -v``, whatever happened before. The volumes
+5. ``scripts/report_results.py``, run in-process after cleanup, writes ``summary.json``
+   (PASS, FAIL or INCOMPLETE, with the final exit status) and ``environment.json`` next to
+   the JUnit file and prints the one-line summary; after a failure the service log is
+   saved as ``service.log`` (best effort: a failure to save it is a warning) before
+   cleanup (#1024). Result files never contain credentials and never change the exit status.
+   The invocation that holds the project lock owns the result files: it removes the
+   previous run's files first, and a refusal after the lock (existing project, failed
+   ownership probe) or an invalid project name leaves a FAIL summary with a ``reason``.
+   An invocation refused because another run holds the lock writes and removes nothing,
+   since the files belong to the active run;
+6. ``docker compose -p <project> down -v``, whatever happened before. The volumes
    belong to the run-owned project, so each run starts from an empty database and
    leaves nothing behind; the ``make docker-up`` project and its volumes are never
    touched (``make docker-clean`` remains the way to delete those).
@@ -33,12 +45,13 @@ so a stray ``CUBRID_TEST_*`` export cannot redirect the run to another server.
 Usage (see the Makefile)::
 
     python scripts/run_integration.py --lane normal --python python3 \
-        --pytest "python3 -m pytest" --port 33000 --results integration-results.xml
+        --pytest "python3 -m pytest" --port 33000
 """
 
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import os
 import re
 import shlex
@@ -49,7 +62,7 @@ import tempfile
 import time
 from collections.abc import Sequence
 from pathlib import Path
-from types import FrameType
+from types import FrameType, ModuleType
 
 try:  # POSIX only: without fcntl (Windows) the same-project guard is skipped.
     import fcntl
@@ -62,6 +75,8 @@ READINESS_ARGS = ("36", "5")
 PROJECT_PATTERN = re.compile(r"[a-z0-9][a-z0-9_-]*")
 # Volumes of docker-compose.yml (#1000, #1002).
 DATA_VOLUMES = ("cubrid-data", "cubrid-databases")
+# Default result directory name of each lane under test-results/ (#1024).
+RESULT_DIRS = {"normal": "integration", "tls": "integration-tls"}
 # Which tests each lane runs is unchanged from the former Makefile recipes.
 LANES = {
     "normal": ("tests/", "-m", "integration and not tls", "-v"),
@@ -170,6 +185,57 @@ def _compose_container(project: str) -> str:
     return completed.stdout.strip() if completed.returncode == 0 else ""
 
 
+def _load_reporter() -> ModuleType:
+    """Import scripts/report_results.py by path, so it works as a script and as a package."""
+    spec = importlib.util.spec_from_file_location(
+        "pycubrid_report_results", ROOT / "scripts" / "report_results.py"
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _report(args: argparse.Namespace, results: Path, status: int, reason: str = "") -> None:
+    """Write environment.json and summary.json; a reporting failure never changes the status."""
+    version = os.environ.get("CUBRID_VERSION") or "11.2"
+    command = f"make {'integration-tls' if args.lane == 'tls' else 'integration'}"
+    common = ["--lane", RESULT_DIRS[args.lane], "--results-dir", str(results.parent)]
+    summarize = [*common, "--junit", str(results), "--exit-code", str(status)]
+    if reason:
+        summarize += ["--reason", reason]
+    try:
+        reporter = _load_reporter()
+        reporter.main(["environment", *common, "--command", command, "--cubrid-version", version])
+        reporter.main(["summarize", *summarize])
+    except Exception as exc:  # noqa: BLE001 - reporting must never change the lane status
+        print(f"WARNING: could not write the result summary: {exc}", file=sys.stderr, flush=True)
+
+
+def _prepare_results(results: Path) -> None:
+    """Remove the previous invocation's files so a stale PASS cannot outlive a new run."""
+    results.parent.mkdir(parents=True, exist_ok=True)
+    for stale in ("summary.json", "environment.json", "service.log"):
+        (results.parent / stale).unlink(missing_ok=True)
+    results.unlink(missing_ok=True)
+
+
+def _save_service_log(project: str, results: Path, compose_env: dict[str, str]) -> None:
+    """Save the compose service log next to the results; best effort, after a failure only."""
+    try:
+        with (results.parent / "service.log").open("wb") as log:
+            subprocess.run(  # nosec B603 B607 - fixed docker compose argv
+                ["docker", "compose", "-p", project, "logs", "--no-color", "cubrid"],
+                cwd=ROOT,
+                env=compose_env,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                check=False,
+            )
+    except OSError as exc:
+        print(f"WARNING: could not save the service log: {exc}", file=sys.stderr, flush=True)
+
+
 def _lane(args: argparse.Namespace, project: str, compose_env: dict[str, str]) -> int:
     status = _run(["docker", "compose", "-p", project, "up", "-d"], compose_env)
     if status:
@@ -206,9 +272,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--project", default="", help="Compose project name (default: run-unique pycubrid-it-*)"
     )
-    parser.add_argument("--results", required=True, help="JUnit XML path")
+    parser.add_argument(
+        "--results",
+        default="",
+        help="JUnit XML path (default: test-results/<integration|integration-tls>/junit.xml)",
+    )
     args = parser.parse_args(argv)
 
+    default = Path("test-results") / RESULT_DIRS[args.lane] / "junit.xml"
+    args.results = str(ROOT / (args.results or default))  # absolute: every step runs in ROOT
     project = args.project
     if project and not PROJECT_PATTERN.fullmatch(project):
         print(
@@ -217,6 +289,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             file=sys.stderr,
             flush=True,
         )
+        results = Path(args.results)
+        _prepare_results(results)
+        _report(args, results, 2, "invalid INTEGRATION_PROJECT; nothing was started")
         return 2
     project = project or f"pycubrid-it-{time.strftime('%Y%m%d%H%M%S')}-{os.getpid()}"
     lock = _reserve(project)
@@ -237,7 +312,14 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 def _run_owned(args: argparse.Namespace, project: str) -> int:
     """Run the lane in the reserved, run-owned project and always clean it up."""
-    if not _owns_nothing(project):
+    results = Path(args.results)
+    _prepare_results(results)
+    try:
+        owns_nothing = _owns_nothing(project)
+    except SystemExit as exc:  # a failed read-only ownership probe
+        _report(args, results, int(exc.code or 1), "ownership check failed; nothing was started")
+        raise
+    if not owns_nothing:
         print(
             f"ERROR: Refusing to run: Compose project '{project}' already has containers, "
             "volumes or networks.\nmake integration only starts and removes a project it "
@@ -245,6 +327,7 @@ def _run_owned(args: argparse.Namespace, project: str) -> int:
             file=sys.stderr,
             flush=True,
         )
+        _report(args, results, 1, f"project '{project}' already has resources; refused to run")
         return 1
     print(f"Using run-owned Compose project '{project}' on host port {args.port}", flush=True)
     if args.lane == "tls":
@@ -266,13 +349,23 @@ def _run_owned(args: argparse.Namespace, project: str) -> int:
     if _signals["received"]:
         print(f"Interrupted by {_signals['received']}; cleaning up", file=sys.stderr, flush=True)
         status = INTERRUPTED
-
-    cleanup = subprocess.run(  # nosec B603 B607 - fixed docker compose argv
-        ["docker", "compose", "-p", project, "down", "-v"], cwd=ROOT, env=compose_env, check=False
-    ).returncode
+    cleanup = 0
+    try:
+        if status:
+            _save_service_log(project, results, compose_env)
+    finally:
+        # Teardown is guaranteed whatever happened above (#1024, #1021).
+        cleanup = subprocess.run(  # nosec B603 B607 - fixed docker compose argv
+            ["docker", "compose", "-p", project, "down", "-v"],
+            cwd=ROOT,
+            env=compose_env,
+            check=False,
+        ).returncode
     if cleanup:
         print(f"ERROR: Docker cleanup failed with status {cleanup}", file=sys.stderr, flush=True)
         status = status or cleanup
+    # The summary is written last, so it carries the final exit status.
+    _report(args, results, status, "docker cleanup failed" if cleanup and not status else "")
     return status
 
 
